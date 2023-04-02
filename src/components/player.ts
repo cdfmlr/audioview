@@ -31,10 +31,13 @@ export enum PlayMode {
  * Track is a sound (src + options) to play.
  */
 export interface Track {
+  id?: string;
   src: string;
   format?: string;
   volume?: number;
   playMode?: PlayMode;
+
+  reporter?: Reporter;
 }
 
 /**
@@ -56,10 +59,19 @@ class Channel {
     if (typeof sound === "string") {
       sound = { src: sound };
     }
-    if (sound.volume === undefined) {
+    if (!sound.src) {
+      throw new Error("sound.src is required");
+    }
+    if (!sound.id) {
+      sound.id = sound.src;
+    }
+    if (!sound.format) {
+      sound.format = "aac";
+    }
+    if (!sound.volume) {
       sound.volume = this.volume;
     }
-    if (sound.playMode === undefined) {
+    if (!sound.playMode) {
       sound.playMode = PlayMode.Next;
     }
 
@@ -100,12 +112,17 @@ class Channel {
       return;
     }
     let next = this.queue[0];
+
     this.current = new Howl({
       src: [next.src],
+      format: next.format,
       loop: this.loop,
       volume: next.volume,
-      autoplay: true,
+      // autoplay: true,
     });
+
+    // after this line: next, current and currentId are all pointing to the same track
+
     this.current.on("end", () => {
       if (this.loop && this.queue.length > 1) {
         // loop 模式下，有下一首，则停止循环，播放下一首，然后把当前歌曲放到队列尾部
@@ -117,6 +134,18 @@ class Channel {
       this.queue.shift();
       this.playNext();
     });
+
+    if (next.reporter) {
+      this.current.on("play", () => {
+        next.reporter?.reportStart();
+      });
+      this.current.on("end", () => {
+        next.reporter?.reportEnd();
+      });
+    }
+
+    this.current.play();
+    console.log(`[Player] play ${next.id}: `, this.current);
   }
 
   public playing(): boolean {
@@ -128,6 +157,12 @@ class Channel {
     this.current?.fade(from, to, duration);
   }
 
+  /**
+   * Attach an event to the current track playing task.
+   *
+   * @param event "play", "end", ... (see https://github.com/goldfire/howler.js#onevent-function-id)
+   * @param callback callback function to be called when event is triggered
+   */
   public once(event: string, callback: Function) {
     this.current?.once(event, () => callback());
   }
@@ -147,10 +182,6 @@ class Player {
   public Fx: Channel = new Channel(FX_VOLUME, false);
   public Sing: Channel = new Channel(SING_VOLUME, false);
   public Vocal: Channel = new Channel(VOCAL_VOLUME, false);
-
-  // why keeps a list of wscontrollers?
-  // emmm, I just want to indicate that multiple wscontrollers are supported.
-  private wscontrollers: WebSocket[] = [];
 
   public playBgm(bgm: Track | string) {
     this.Bgm.play(bgm);
@@ -179,9 +210,36 @@ class Player {
       this.Sing.fade(SING_VOLUME_ON_VOCAL, SING_VOLUME, FADE_TIME);
     });
   }
+}
+
+// Player singleton
+const player = new Player();
+
+/**
+ * usePlayer returns the Player singleton.
+ * @returns the Player singleton
+ */
+export function usePlayer() {
+  return player;
+}
+
+/**
+ * WsController is a Player controller via websocket.
+ */
+export class WsController {
+  /**
+   * player is the player that this controller controls.
+   */
+  private player: Player;
+
+  public wscontrollers: WebSocket[] = [];
+
+  constructor(player: Player) {
+    this.player = player;
+  }
 
   /**
-   * connectController connects to a player controller via websocket.
+   * dial connects to a player controller via websocket.
    *
    * A player controller is a websocket server that can control the player,
    * that is a server sends following commands to the player:
@@ -192,6 +250,10 @@ class Player {
    * - playVocal: `{ cmd: "playVocal", data: Track | string }`
    * - keepAlive: `{ cmd: "keepAlive" }` for every 30 seconds (both sides do this)
    *
+   * And player will send following events to the controller:
+   *
+   * - report: `{ cmd: "report", data: { id: string, status: "start | end" } }`
+   *
    * data is a Track object (that is, `{ src: string, volume?: number, playMode?: PlayMode }`)
    *  or a string (url: `"http://xxx"` or data base64: `"data:audio/mp3;base64,xxxx"`)
    *
@@ -200,7 +262,7 @@ class Player {
    *
    * @param wsAddr controller's websocket address
    */
-  public connectController(wsAddr: string) {
+  public dial(wsAddr: string) {
     const ws = new WebSocket(wsAddr);
 
     ws.onopen = () => {
@@ -208,25 +270,7 @@ class Player {
       this.wscontrollers.push(ws);
     };
     ws.onmessage = (e) => {
-      const msg = JSON.parse(e.data);
-      switch (msg.cmd) {
-        case "playBgm":
-          this.playBgm(msg.data);
-          break;
-        case "playFx":
-          this.playFx(msg.data);
-          break;
-        case "playSing":
-          this.playSing(msg.data);
-          break;
-        case "playVocal":
-          this.playVocal(msg.data);
-          break;
-        case "keepAlive":
-          break;
-        default:
-          console.warn(`unknown command: ${msg.cmd}`);
-      }
+      this.handleWsMsg(e);
     };
     ws.onclose = () => {
       console.log("disconnected from controller");
@@ -242,15 +286,98 @@ class Player {
       ws.send(JSON.stringify({ cmd: "keepAlive" }));
     }, KEEP_ALIVE_INTERVAL);
   }
+
+  /**
+   * handleWsMsg handles websocket message from controller.
+   * It prases the command and calls the corresponding player method.
+   *
+   * @param e MessageEvent from websocket
+   */
+  private handleWsMsg(e: MessageEvent) {
+    const msg = JSON.parse(e.data);
+    switch (msg.cmd) {
+      case "playBgm":
+        this.player.playBgm(this.trackWithReporter(msg.data));
+        break;
+      case "playFx":
+        this.player.playFx(this.trackWithReporter(msg.data));
+        break;
+      case "playSing":
+        this.player.playSing(this.trackWithReporter(msg.data));
+        break;
+      case "playVocal":
+        this.player.playVocal(this.trackWithReporter(msg.data));
+        break;
+      case "keepAlive":
+        break;
+      default:
+        console.warn(`unknown command: ${msg.cmd}`);
+    }
+  }
+
+  /**
+   * track += reporter
+   */
+  private trackWithReporter(track: Track | string): Track {
+    if (typeof track === "string") {
+      return { src: track };
+    }
+    if (!track.reporter) {
+      track.reporter = new WsReporter(
+        track.id ?? track.src,
+        this.wscontrollers
+      );
+    }
+    return track;
+  }
 }
 
-// Player singleton
-const player = new Player();
+/**
+ * Report is the data field of "report" command,
+ * that is, `{ cmd: "report", data: Report }`
+ *
+ * This is used to report the status of a task to the controller.
+ */
+interface Report {
+  id: string;
+  status: "start" | "end";
+}
 
 /**
- * usePlayer returns the Player singleton.
- * @returns the Player singleton
+ * Reporter reports the status of a task (we name a task as a "Track" unfortunately)
+ * to all connected controllers.
  */
-export function usePlayer() {
-  return player;
+interface Reporter {
+  reportStart(): void;
+  reportEnd(): void;
+}
+
+class WsReporter {
+  public id: string;
+  public wscontrollers: WebSocket[] = [];
+
+  constructor(id: string, wscontrollers: WebSocket[]) {
+    this.id = id;
+    this.wscontrollers = wscontrollers;
+  }
+
+  public reportStart() {
+    this.report("start");
+  }
+
+  public reportEnd() {
+    this.report("end");
+  }
+
+  private report(status: "start" | "end") {
+    console.log(`report: ${this.id} ${status}`);
+    this.wscontrollers.forEach((ws) => {
+      ws.send(
+        JSON.stringify({
+          cmd: "report",
+          data: { id: this.id, status } as Report,
+        })
+      );
+    });
+  }
 }
