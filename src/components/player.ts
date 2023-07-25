@@ -234,6 +234,12 @@ export class WsController {
 
   public wscontrollers: WebSocket[] = [];
 
+  private _toBeReset: boolean = false;
+
+  public get toBeReset(): boolean {
+    return this._toBeReset;
+  }
+
   constructor(player: Player) {
     this.player = player;
   }
@@ -249,6 +255,7 @@ export class WsController {
    * - playSing: `{ cmd: "playSing", data: Track | string }`
    * - playVocal: `{ cmd: "playVocal", data: Track | string }`
    * - keepAlive: `{ cmd: "keepAlive" }` for every 30 seconds (both sides do this)
+   * - reset: `{ cmd: "reset" }` to reset the player (reload current page, reconnect websocket)  
    *
    * And player will send following events to the controller:
    *
@@ -309,6 +316,9 @@ export class WsController {
         this.player.playVocal(this.trackWithReporter(msg.data));
         break;
       case "keepAlive":
+        break;
+      case "reset":
+        this._toBeReset = true;
         break;
       default:
         console.warn(`unknown command: ${msg.cmd}`);

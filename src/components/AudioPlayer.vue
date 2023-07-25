@@ -22,6 +22,11 @@ onMounted(() => {
 });
 
 setInterval(() => {
+  if (controller.toBeReset) {
+    console.log("reset audioview.");
+    // reload page
+    window.location.reload();
+  }
   if (controller.wscontrollers.length === 0) {
     console.log("no controllers connected. trying to connect...");
     connectToControllers();
